@@ -1,0 +1,949 @@
+;	STRAT1.MAC - Stratego for UKNC, UI in MACRO-11.
+;
+;	C calling convention (pdp11-uknc-rt11-gcc): arguments pushed right to
+;	left, one word each (u8/s8 too, the callee reads the low byte), caller
+;	pops, result in R0.  R0,R1 are scratch.  The C entry points are called
+;	through the short aliases in api.ld.
+
+	.TITLE	STRAT1
+	.ENABL	LC
+	.GLOBL	START, MAINLP, BLUMOV, WTKEY, GAMEOVR, ROUNDN, HINTF, FROMID, MV, CI	; globals for gdb
+	.GLOBL	GSTACK, RNGSED, AIRST, AICHMV, GMNEW, GMLEGL, GMAPLY, GSTATE
+
+	.INCLUDE	/STCORE.MAC/
+
+C.BLU	=	5			; character colours (ESC 240 n): "blue" (cyan), red, white
+C.RED	=	2
+C.NEU	=	7
+C.LAK	=	1			; blue, for the lakes
+C.YEL	=	6			; yellow, for the game-over sign
+LOGC	=	23.			; screen column of the two move lines (right of the prompt)
+HISTN	=	6.			; moves kept in the history list
+HROW0	=	17.			; screen row of the oldest history line
+HE.COL	=	0.			; history entry: colour, mover rank, from c/r, to c/r,
+HE.RK	=	1.			; fought, defender rank, outcome, (pad)
+HE.FC	=	2.
+HE.FR	=	3.
+HE.TC	=	4.
+HE.TR	=	5.
+HE.FGT	=	6.
+HE.DEF	=	7.
+HE.RES	=	8.
+HE.SIZ	=	10.
+PRMW	=	39.			; blanks cleared on the prompt line (columns 0..38)
+PRMLEN	=	2.			; width of the prompt "> "; the cursor waits after it
+HINTC	=	PRMLEN+3.		; screen column of the hint, 3 to the right of the cursor
+STATC	=	23.			; screen column of the statistics panel
+STKSIZ	=	1024.			; size of g_stack (stack.c)
+BOARDC	=	2			; screen column of the board's first cell
+
+START:	CLR	@#177560		; keyboard: disable console receiver interrupt
+;	BIS	#010000, @#44		; disable Ctrl-C
+	MOV	SP, OSTACK		; remember the initial SP
+	MOV	#GSTACK+STKSIZ, SP	; own stack (the C array g_stack, in bss): the default one (at
+					; 041000) is too close to our bss now
+
+	MOV	#GAMESC, R1		; intro screen setup string (80x24), clears the screen
+	JSR	PC, PRINT
+	JSR	PC, PAUSE		; wait for the PPU to clear the screen
+	JSR	PC, INTRO		; welcome, rules and controls screens, then 40x24
+
+	MOV	RNDSEED, R0		; seed of the first game: time spent on the intro pages
+	JSR	PC, NEWGAME
+
+; Command loop: the first key decides.  A-J starts a move typed as A6A5
+; (from column, row, to column, row), N starts a new game, X quits to RT-11.
+MAINLP:	JSR	PC, PROMPT
+	JSR	PC, GETCH
+	CMP	R0, #15			; Enter is ignored: the hint stays as it is
+	BEQ	MAINLP
+	CMP	R0, #'N
+	BNE	1$
+	CLR	HINTF
+	MOV	#NEWTXT, R1		; N: new game, after a Y/N confirmation
+	JSR	PC, CONFIRM
+	BEQ	MAINLP
+	MOV	RNDSEED, R0		; seed from the time spent waiting for keys
+	JSR	PC, NEWGAME
+	BR	MAINLP
+1$:	CMP	R0, #'X
+	BNE	3$
+	CLR	HINTF
+	MOV	#EXTTXT, R1		; X: back to RT-11, after a Y/N confirmation
+	JSR	PC, CONFIRM
+	BEQ	MAINLP
+	BR	FINISH
+3$:	CMP	R0, #'R
+	BNE	4$
+	CLR	HINTF
+	MOV	#RSGTXT, R1		; R: resign, after a Y/N confirmation
+	JSR	PC, CONFIRM
+	BEQ	MAINLP
+	MOV	#2, R0			; 2 = resigned
+	JSR	PC, GAMEOVR
+	BR	MAINLP
+4$:	CMP	R0, #'A
+	BLO	2$
+	CMP	R0, #'K
+	BHIS	2$
+	CLR	HINTF
+	JSR	PC, CLRHNT
+	JSR	PC, DOMOVE
+	BR	MAINLP
+2$:	MOV	#HNTTXT, HINTF	; wrong key: PROMPT shows the hint next to the prompt
+	BR	MAINLP
+
+; NEWGAME: R0 = seed.  New armies, the computer (RED) makes the first move of
+; round 1, then the screen is redrawn.
+NEWGAME: MOV	R0, -(SP)
+	MOV	#GSTATE, -(SP)
+	JSR	PC, GMNEW
+	ADD	#4, SP
+	JSR	PC, AIRST
+	CLR	ROUNDN
+	CLR	REVEAL
+	JSR	PC, CLRHST
+	JSR	PC, CMOVE
+	JSR	PC, DRAWALL
+	RETURN
+
+; CONFIRM: ask a Y/N question to the right of the prompt; R1 = question text
+; (ending in a blank, where the cursor waits).  Returns R0 = 1 for Y, 0 for any
+; other key, with the condition codes set accordingly.  Clobbers R0-R3.
+CONFIRM: MOV	R1, -(SP)
+	MOV	#23., R1
+	MOV	#HINTC, R2
+	JSR	PC, GOTOXY
+	MOV	(SP)+, R1
+	JSR	PC, PRINT
+	JSR	PC, GETCH		; echoed, upper-cased
+	CMP	R0, #'Y
+	BEQ	1$
+	CLR	R0
+	RETURN
+1$:	MOV	#1, R0
+	RETURN
+
+; INTRO: show the three intro screens (text from INTROSC.MAC, made from
+; INTRO.TXT by tools/mkintro.py) on the 80x24 text screen set up by GAMESC,
+; each until a key, then switch to the 40x24 game screen (GAME40).
+INTRO:	MOV	#INTR1, R1
+	JSR	PC, ONESCR
+	MOV	#INTR2, R1
+	JSR	PC, ONESCR
+	MOV	#INTR3, R1
+	JSR	PC, ONESCR
+	MOV	#GAME40, R1		; back to the 40x24 game screen (also clears it)
+	JSR	PC, PRINT
+	JMP	PAUSE
+
+; ONESCR: clear the screen, show the text at R1, wait for a key.
+ONESCR:	MOV	#14, R0			; FF: clear screen
+	JSR	PC, PUTC
+	JSR	PC, PAUSE
+	JSR	PC, PRINT
+	JMP	WTKEY
+
+; FINISH: clear the screen, restore the SP and return to RT-11.
+FINISH:	MOV	#EXITSC, R1
+	JSR	PC, PRINT
+	JSR	PC, PAUSE
+	MOV	OSTACK, SP
+	EMT	350			; .EXIT
+
+; DRAWALL: redraw board and statistics.
+DRAWALL: JSR	PC, DRAWBD
+	JMP	DRAWST
+
+BADMV:	MOV	#MSGBAD, HINTF
+	RETURN
+
+; DOMOVE: R0 = from-column letter, already echoed.  Read the other three
+; characters (row, column, row), check the move, play it, then let the computer
+; answer.
+DOMOVE:	SUB	#'A, R0
+	MOV	R0, MVFC
+	JSR	PC, GETCH		; from row
+	SUB	#'0, R0
+	CMP	R0, #10.
+	BHIS	BADMV
+	MOV	R0, MVFR
+	JSR	PC, GETCH		; to column
+	SUB	#'A, R0
+	CMP	R0, #10.
+	BHIS	BADMV
+	MOV	R0, MVTC
+	JSR	PC, GETCH		; to row
+	SUB	#'0, R0
+	CMP	R0, #10.
+	BHIS	BADMV
+	MOV	R0, MVTR
+
+	; GMLEGL(&g_state, SIDE_PLAY, fc, fr, tc, tr) -> R0 (0 = illegal)
+	MOV	MVTR, -(SP)
+	MOV	MVTC, -(SP)
+	MOV	MVFR, -(SP)
+	MOV	MVFC, -(SP)
+	MOV	#SIDE.P, -(SP)
+	MOV	#GSTATE, -(SP)
+	JSR	PC, GMLEGL
+	ADD	#14, SP
+	TSTB	R0
+	BNE	2$
+	MOV	#MSGILL, HINTF
+	RETURN
+
+2$:	MOV	MVFR, R1		; mover's rank: grid[fr*10+fc] -> play[index]
+	ASL	R1
+	MOV	R1, R0
+	ASL	R1
+	ASL	R1
+	ADD	R0, R1			; 10 * fr
+	ADD	MVFC, R1
+	MOVB	GSTATE+GS.GRI(R1), R1
+	BIC	#177700, R1		; piece index
+	MOV	R1, R0
+	ASL	R1
+	ADD	R0, R1			; 3 * index
+	MOVB	GSTATE+GS.PLA(R1), R0
+	MOV	R0, SMRK
+
+	; GMAPLY(&g_state, SIDE_PLAY, fc, fr, tc, tr, &ci)
+	MOV	#CI, -(SP)
+	MOV	MVTR, -(SP)
+	MOV	MVTC, -(SP)
+	MOV	MVFR, -(SP)
+	MOV	MVFC, -(SP)
+	MOV	#SIDE.P, -(SP)
+	MOV	#GSTATE, -(SP)
+	JSR	PC, GMAPLY
+	ADD	#16, SP
+	MOV	#C.BLU, SMCOL
+	MOV	MVFC, SMFC
+	MOV	MVFR, SMFR
+	MOV	MVTC, SMTC
+	MOV	MVTR, SMTR
+	JSR	PC, ADDMV
+	TSTB	CI+CB.FLG		; flag captured?
+	BEQ	3$
+	JSR	PC, DRAWALL
+	MOV	#1, R0			; blue took the flag: blue wins
+	JMP	GAMEOVR
+3$:	JSR	PC, CMOVE		; R0 = 0 (play on), 1 (RED took the flag), 2 (RED stuck)
+	MOV	R0, -(SP)
+	INC	ROUNDN
+	JSR	PC, DRAWALL
+	MOV	(SP)+, R0
+	BEQ	4$
+	DEC	R0			; 1 -> 0: blue lost, 2 -> 1: blue won
+	JMP	GAMEOVR
+4$:	JSR	PC, BLUMOV		; can blue still move?
+	TST	R0
+	BNE	5$
+	CLR	R0			; no: blue lost
+	JMP	GAMEOVR
+5$:	RETURN
+
+; BLUMOV: does the player have any legal move?  R0 = 1 if so, 0 if not.  A
+; piece can move at all only if it can make a one-step move (a scout's longer
+; moves start with one), so the four neighbours of each live piece are tried
+; with game_legal.  Bombs and the flag are rejected by game_legal itself.
+; Clobbers R0-R3.
+BLUMOV:	CLR	BMI
+1$:	MOV	BMI, R1
+	MOV	R1, R0
+	ASL	R1
+	ADD	R0, R1			; 3 * piece index
+	TSTB	GSTATE+GS.PLA+PC.VAL(R1)
+	BEQ	4$			; dead
+	MOVB	GSTATE+GS.PLA+PC.COL(R1), R0
+	MOV	R0, BMC
+	MOVB	GSTATE+GS.PLA+PC.ROW(R1), R0
+	MOV	R0, BMR
+	CLR	BMD
+2$:	MOV	BMD, R1
+	ASL	R1
+	MOVB	DIRS(R1), R0		; dc (signed byte)
+	ADD	BMC, R0
+	MOV	R0, BMTC
+	MOVB	DIRS+1(R1), R0		; dr
+	ADD	BMR, R0
+	MOV	R0, -(SP)		; tr
+	MOV	BMTC, -(SP)		; tc
+	MOV	BMR, -(SP)		; fr
+	MOV	BMC, -(SP)		; fc
+	MOV	#SIDE.P, -(SP)
+	MOV	#GSTATE, -(SP)
+	JSR	PC, GMLEGL
+	ADD	#14, SP
+	TSTB	R0
+	BNE	5$			; found one
+	INC	BMD
+	CMP	BMD, #4
+	BLO	2$
+4$:	INC	BMI
+	CMP	BMI, #40.
+	BLO	1$
+	CLR	R0			; none
+	RETURN
+5$:	MOV	#1, R0
+	RETURN
+
+; GAMEOVR: the game is over; R0 = 1 if blue won, 0 if blue lost, 2 if blue
+; resigned.  The computer's pieces are revealed on the board.  Shows a
+; yellow "GAME OVER" under the move history (plus "YOU WIN!" or "YOU LOST" at
+; the left), puts the cursor on it, waits for any key and starts a new game.
+GAMEOVR: MOV	R0, -(SP)
+	MOV	#1, REVEAL		; show the computer's pieces
+	JSR	PC, DRAWBD
+	MOV	#23., R1		; blank the prompt line
+	CLR	R2
+	JSR	PC, GOTOXY
+	MOV	#PRMW, R3
+	JSR	PC, CLRLN
+	MOV	#23., R1
+	CLR	R2
+	JSR	PC, GOTOXY
+	CMP	(SP), #2
+	BEQ	3$
+	TST	(SP)
+	BEQ	1$
+	MOV	#C.BLU, R1		; blue won
+	JSR	PC, SETCOL
+	MOV	#WINTXT, R1
+	BR	2$
+3$:	MOV	#C.BLU, R1		; blue resigned
+	JSR	PC, SETCOL
+	MOV	#RSGOUT, R1
+	BR	2$
+1$:	MOV	#C.RED, R1		; blue lost
+	JSR	PC, SETCOL
+	MOV	#LOSTXT, R1
+2$:	JSR	PC, PRINT
+	MOV	#23., R1
+	MOV	#LOGC, R2
+	JSR	PC, GOTOXY
+	MOV	#C.YEL, R1
+	JSR	PC, SETCOL
+	MOV	#OVRTXT, R1
+	JSR	PC, PRINT		; the cursor stays right after the sign
+	JSR	PC, WTKEY
+	TST	(SP)+
+	MOV	#C.NEU, R1
+	JSR	PC, SETCOL
+	MOV	RNDSEED, R0
+	JMP	NEWGAME
+
+; CMOVE: the computer's move.  Returns R0 = 0 (play on), 1 (it took the
+; player's flag) or 2 (it has no move left).  Clobbers R0-R3.
+CMOVE:	; AICHMV(&g_state, &from_id, &mv) -> R0 (0 = resign)
+	MOV	#MV, -(SP)
+	MOV	#FROMID, -(SP)
+	MOV	#GSTATE, -(SP)
+	JSR	PC, AICHMV
+	ADD	#6, SP
+	TST	R0
+	BNE	1$
+	MOV	#2, R0
+	RETURN
+
+1$:	; R1 = &g_state.comp[from_id]
+	MOVB	FROMID, R1
+	MOV	R1, R0
+	ASL	R0
+	ADD	R0, R1			; *3
+	ADD	#GSTATE+GS.COM, R1
+
+	MOVB	PC.VAL(R1), R0		; remember rank and origin for SHOWMV
+	MOV	R0, SMRK
+	MOVB	PC.COL(R1), R0
+	MOV	R0, SMFC
+	MOVB	PC.ROW(R1), R0
+	MOV	R0, SMFR
+
+	; GMAPLY(&g_state, SIDE_COMP, fc, fr, tc, tr, &ci)
+	MOV	#CI, -(SP)
+	MOVB	MV+MV.ROW, R0
+	MOV	R0, -(SP)		; tr
+	MOVB	MV+MV.COL, R0
+	MOV	R0, -(SP)		; tc
+	MOVB	PC.ROW(R1), R0
+	MOV	R0, -(SP)		; fr
+	MOVB	PC.COL(R1), R0
+	MOV	R0, -(SP)		; fc
+	MOV	#SIDE.C, -(SP)
+	MOV	#GSTATE, -(SP)
+	JSR	PC, GMAPLY
+	ADD	#16, SP
+	MOV	#C.RED, SMCOL
+	MOVB	MV+MV.COL, R0
+	MOV	R0, SMTC
+	MOVB	MV+MV.ROW, R0
+	MOV	R0, SMTR
+	JSR	PC, ADDMV
+	CLR	R0
+	TSTB	CI+CB.FLG		; player's flag captured?
+	BEQ	2$
+	MOV	#1, R0
+2$:	RETURN
+
+; PROMPT: show "> " at the bottom left (column 0), and the hint/error text
+; that HINTF points to (0 = none) a few characters to the right of the cursor.
+; The move lines at the right (column LOGC) are not touched.
+PROMPT:	MOV	#23., R1		; blank the prompt line
+	CLR	R2
+	JSR	PC, GOTOXY
+	MOV	#PRMW, R3
+	JSR	PC, CLRLN
+	MOV	#23., R1
+	CLR	R2
+	JSR	PC, GOTOXY
+	MOV	#C.BLU, R1
+	JSR	PC, SETCOL
+	MOV	#PRMTXT, R1
+	JSR	PC, PRINT
+	MOV	#C.NEU, R1
+	JSR	PC, SETCOL
+	TST	HINTF			; hint after a wrong key
+	BEQ	1$
+	MOV	#23., R1
+	MOV	#HINTC, R2
+	JSR	PC, GOTOXY
+	MOV	HINTF, R1
+	JSR	PC, PRINT
+	MOV	#23., R1		; cursor back after the prompt
+	MOV	#PRMLEN, R2
+	JSR	PC, GOTOXY
+1$:	RETURN
+
+; CLRHNT: erase the hint (right of the first typed character) so that the
+; rest of the move can be typed over a clean line.
+CLRHNT:	MOV	R0, -(SP)		; preserves R0 (the key)
+	MOV	#23., R1
+	MOV	#PRMLEN+1, R2
+	JSR	PC, GOTOXY
+	MOV	#HINTC+16.-PRMLEN-1, R3
+	JSR	PC, CLRLN
+	MOV	#23., R1
+	MOV	#PRMLEN+1, R2
+	JSR	PC, GOTOXY
+	MOV	(SP)+, R0
+	RETURN
+
+; ADDMV: append a move to the history (the oldest of HISTN falls out) and
+; redraw the history.  Input: SMCOL (colour of the side), mover SMRK, from
+; SMFC/SMFR, to SMTC/SMTR, and the combat in CI.  Clobbers R0-R5.
+ADDMV:	MOV	#HIST, R1		; shift the entries up by one
+	MOV	#HIST+HE.SIZ, R2
+	MOV	#<HISTN-1>*HE.SIZ/2, R3
+1$:	MOV	(R2)+, (R1)+
+	SOB	R3, 1$
+	MOVB	SMCOL, (R1)+		; HE.COL
+	MOVB	SMRK, (R1)+		; HE.RK
+	MOVB	SMFC, (R1)+		; HE.FC
+	MOVB	SMFR, (R1)+		; HE.FR
+	MOVB	SMTC, (R1)+		; HE.TC
+	MOVB	SMTR, (R1)+		; HE.TR
+	MOVB	CI+CB.FGT, (R1)+	; HE.FGT
+	MOVB	CI+CB.DEF, (R1)+	; HE.DEF
+	MOVB	CI+CB.RES, (R1)+	; HE.RES
+	CLRB	(R1)+
+	JMP	DRAWHS
+
+; CLRHST: forget the history (a new game).
+CLRHST:	MOV	#HIST, R1
+	MOV	#HISTN*HE.SIZ/2, R3
+1$:	CLR	(R1)+
+	SOB	R3, 1$
+	RETURN
+
+; DRAWHS: draw the last HISTN moves at column LOGC, rows HROW0.., oldest on
+; top; unused entries are blank lines.  Clobbers R0-R5.
+DRAWHS:	MOV	#HIST, R4
+	MOV	#HROW0, R5
+	MOV	#HISTN, -(SP)
+1$:	JSR	PC, SHOWMV
+	ADD	#HE.SIZ, R4
+	INC	R5
+	DEC	(SP)
+	BNE	1$
+	TST	(SP)+
+	RETURN
+
+; SHOWMV: print the history entry at R4 on screen row R5 from column LOGC, in
+; the side's colour, e.g. "F3-F6 2" or, for an attack, "F3-F6 2 > B won": the
+; move, the mover's rank glyph, then the defender's glyph and the outcome for
+; the mover (won, lost or tie).  An empty entry just blanks the line.
+; Clobbers R0-R3.
+SHOWMV:	MOV	R5, R1			; blank the line
+	MOV	#LOGC, R2
+	JSR	PC, GOTOXY
+	MOV	#40.-LOGC, R3
+	JSR	PC, CLRLN
+	TSTB	HE.COL(R4)
+	BEQ	2$
+	MOV	R5, R1
+	MOV	#LOGC, R2
+	JSR	PC, GOTOXY
+	MOVB	HE.COL(R4), R1
+	JSR	PC, SETCOL
+	MOVB	HE.FC(R4), R0
+	ADD	#'A, R0
+	JSR	PC, PUTC
+	MOVB	HE.FR(R4), R0
+	ADD	#'0, R0
+	JSR	PC, PUTC
+	MOV	#'-, R0
+	JSR	PC, PUTC
+	MOVB	HE.TC(R4), R0
+	ADD	#'A, R0
+	JSR	PC, PUTC
+	MOVB	HE.TR(R4), R0
+	ADD	#'0, R0
+	JSR	PC, PUTC
+	MOV	#40, R0			; blank, then the mover's rank glyph
+	JSR	PC, PUTC
+	MOVB	HE.RK(R4), R1
+	MOVB	RANKCH(R1), R0
+	JSR	PC, PUTC
+	TSTB	HE.FGT(R4)		; an attack: " -> " and the defender's glyph
+	BEQ	1$
+	MOV	#ARROW, R1
+	JSR	PC, PRINT
+	MOVB	HE.DEF(R4), R1
+	MOVB	RANKCH(R1), R0
+	JSR	PC, PUTC
+	MOVB	HE.RES(R4), R1		; outcome from the mover's point of view
+	ASL	R1
+	MOV	RESTAB(R1), R1
+	JSR	PC, PRINT
+1$:	MOV	#C.NEU, R1
+	JSR	PC, SETCOL
+2$:	RETURN
+
+; CLRLN: print R3 blanks (callers stay below 39 on the bottom line: the last
+; column would scroll the screen); clobbers R0, R3.
+CLRLN:
+	MOV	#40, R0
+1$:	JSR	PC, PUTC
+	SOB	R3, 1$
+	RETURN
+
+; GETCH: wait for a key, upper-case it, echo it when printable; R0 = key.
+GETCH:	JSR	PC, WTKEY
+	CMP	R0, #141		; lower case => upper case
+	BLO	1$
+	CMP	R0, #172
+	BHI	1$
+	SUB	#40, R0
+1$:	CMP	R0, #40			; echo printable keys only
+	BLO	2$
+	CMP	R0, #177
+	BHIS	2$
+	JSR	PC, PUTC
+2$:	RETURN
+
+; DRAWST: draw the piece statistics panel (surviving pieces per rank, RED =
+; computer, BLUE = player) at screen column STATC, rows 0..14 (names are
+; 8 characters at most, hence LIEUT.); row 13 holds the totals,
+; row 14 the move number.  Clobbers R0-R5.
+DRAWST:	CLR	TOTR
+	CLR	TOTB
+	CLR	R1
+	MOV	#STATC+10., R2		; header above the two count columns
+	JSR	PC, GOTOXY
+	MOV	#C.RED, R1
+	JSR	PC, SETCOL
+	MOV	#HDRRED, R1
+	JSR	PC, PRINT
+	MOV	#C.BLU, R1
+	JSR	PC, SETCOL
+	MOV	#HDRBLU, R1
+	JSR	PC, PRINT
+	CLR	R3			; panel row
+1$:	MOV	R3, R1
+	INC	R1			; screen row = 1 + panel row
+	MOV	#STATC, R2
+	JSR	PC, GOTOXY
+	MOV	#C.NEU, R1
+	JSR	PC, SETCOL
+	MOVB	STRANK(R3), R4		; rank
+	MOVB	RANKCH(R4), R0
+	JSR	PC, PUTC		; rank glyph
+	MOV	#40, R0
+	JSR	PC, PUTC
+	MOV	R3, R0			; name = STNAME + 9 * row
+	ASL	R0
+	ASL	R0
+	ASL	R0			; 8r
+	ADD	R3, R0			; 9r
+	ADD	#STNAME, R0
+	MOV	R0, R1
+	JSR	PC, PRINT
+	MOV	#40, R0
+	JSR	PC, PUTC
+	MOV	#C.RED, R1
+	JSR	PC, SETCOL
+	MOV	R4, R0			; computer count
+	MOV	#GSTATE+GS.COM, R1
+	JSR	PC, COUNT
+	ADD	R0, TOTR
+	ADD	#60, R0
+	JSR	PC, PUTC
+	MOV	#40, R0
+	JSR	PC, PUTC
+	JSR	PC, PUTC
+	JSR	PC, PUTC
+	MOV	#C.BLU, R1
+	JSR	PC, SETCOL
+	MOV	R4, R0			; player count
+	MOV	#GSTATE+GS.PLA, R1
+	JSR	PC, COUNT
+	ADD	R0, TOTB
+	ADD	#60, R0
+	JSR	PC, PUTC
+	INC	R3
+	CMP	R3, #12.
+	BLO	1$
+	MOV	#13., R1		; totals row, no title
+	MOV	#STATC+10., R2		; two-character fields ending in the count columns
+	JSR	PC, GOTOXY
+	MOV	#C.RED, R1
+	JSR	PC, SETCOL
+	MOV	TOTR, R0
+	JSR	PC, NUM2
+	MOV	#40, R0
+	JSR	PC, PUTC
+	JSR	PC, PUTC
+	MOV	#C.BLU, R1
+	JSR	PC, SETCOL
+	MOV	TOTB, R0
+	JSR	PC, NUM2
+	MOV	#14., R1		; current move number, below the totals
+	MOV	#STATC, R2
+	JSR	PC, GOTOXY
+	MOV	#C.NEU, R1
+	JSR	PC, SETCOL
+	MOV	#MOVEST, R1
+	JSR	PC, PRINT
+	MOV	ROUNDN, R0
+	INC	R0			; moves are counted from 1
+	JMP	PRTDEC
+
+; PRTDEC: print R0 (unsigned) in decimal without leading zeros;
+; clobbers R0-R3.
+PRTDEC:	CLR	R1			; non-zero digit seen
+	MOV	#100., R2
+	JSR	PC, PD1
+	MOV	#10., R2
+	JSR	PC, PD1
+	ADD	#60, R0			; units are always printed
+	JMP	PUTC
+
+; PD1: divide R0 by R2 (R1 = leading-zero flag), print the digit unless it
+; is a leading zero; the remainder stays in R0.  Clobbers R3.
+PD1:	CLR	R3
+1$:	CMP	R0, R2
+	BLO	2$
+	SUB	R2, R0
+	INC	R3
+	BR	1$
+2$:	TST	R3
+	BNE	3$
+	TST	R1
+	BEQ	4$
+3$:	INC	R1
+	MOV	R0, -(SP)
+	MOV	R3, R0
+	ADD	#60, R0
+	JSR	PC, PUTC
+	MOV	(SP)+, R0
+4$:	RETURN
+
+; NUM2: print R0 (0..99) in two characters, right aligned; clobbers R0, R1.
+NUM2:	CLR	R1			; tens
+1$:	CMP	R0, #10.
+	BLO	2$
+	SUB	#10., R0
+	INC	R1
+	BR	1$
+2$:	MOV	R0, -(SP)		; ones
+	MOV	#40, R0			; blank when there are no tens
+	TST	R1
+	BEQ	3$
+	MOV	R1, R0
+	ADD	#60, R0
+3$:	JSR	PC, PUTC
+	MOV	(SP)+, R0
+	ADD	#60, R0
+	JMP	PUTC
+
+; COUNT: number of pieces of rank R0 in the Piece[40] array at R1;
+; returns it in R0; clobbers R1, R2.
+COUNT:	CLR	-(SP)
+	MOV	#40., R2
+1$:	CMPB	(R1), R0
+	BNE	2$
+	INC	(SP)
+2$:	ADD	#PC.SIZ, R1
+	SOB	R2, 1$
+	MOV	(SP)+, R0
+	RETURN
+
+; DRAWBD: draw the whole board from g_state.grid.  Computer pieces red, player
+; pieces blue, everything else white.  Each cell is 2x2 characters:
+; the glyph sits in the upper line, the lower line stays blank.  Screen row
+; = 2 * board row.
+; 	..  empty	~~  lake (blue)	[]  computer piece (hidden)
+;	rank char + ' ' or '*' (computer has identified it)  player piece
+; Row numbers 0-9 go in column 0 and letters A-J under the board (screen
+; row 20), so the cells start at screen column BOARDC: column = BOARDC + 2 * board column.
+; Clobbers R0-R5.
+DRAWBD:	CLR	R3			; board row
+1$:	MOV	R3, R1
+	ASL	R1			; screen row = 2 * row
+	CLR	R2			; column 0
+	JSR	PC, GOTOXY
+	MOV	#C.NEU, R1
+	JSR	PC, SETCOL
+	MOV	R3, R0
+	ADD	#60, R0			; row number '0'..'9' in column 0
+	JSR	PC, PUTC
+	MOV	#BOARDC-1, R2		; pad up to the first cell
+5$:	MOV	#40, R0
+	JSR	PC, PUTC
+	SOB	R2, 5$
+	MOV	R3, R0			; R4 = &grid[row * 10]
+	ASL	R0			; 2r
+	MOV	R0, R4
+	ASL	R0
+	ASL	R0			; 8r
+	ADD	R0, R4			; 10r
+	ADD	#GSTATE+GS.GRI, R4
+	MOV	#10., R5		; cells in the row
+2$:	MOVB	(R4)+, R0
+	BIC	#177400, R0		; unsigned cell byte
+	JSR	PC, CELL
+	SOB	R5, 2$
+	INC	R3
+	CMP	R3, #10.
+	BLO	1$
+	MOV	#20., R1		; column letters under the board
+	MOV	#BOARDC, R2
+	JSR	PC, GOTOXY
+	MOV	#C.NEU, R1
+	JSR	PC, SETCOL
+	MOV	#101, R3		; 'A'
+3$:	MOV	R3, R0
+	JSR	PC, PUTC
+	MOV	#40, R0
+	JSR	PC, PUTC
+	INC	R3
+	CMP	R3, #101+10.
+	BLO	3$
+	RETURN
+
+; CELL: print the two-character glyph of a grid cell; R0 = cell byte;
+; clobbers R0-R2.
+CELL:	TST	R0			; empty?
+	BNE	1$
+	MOV	#C.NEU, R1
+	JSR	PC, SETCOL
+	MOV	#56, R0			; '.'
+	BR	DUP
+1$:	CMP	R0, #1			; lake?
+	BNE	2$
+	MOV	#C.LAK, R1
+	JSR	PC, SETCOL
+	MOV	#176, R0		; '~'
+	BR	DUP
+2$:	BIT	#200, R0		; player piece?
+	BNE	3$
+	MOV	#C.RED, R1
+	JSR	PC, SETCOL
+	TST	REVEAL			; game over: show the rank
+	BEQ	5$
+	BIC	#177700, R0		; piece index
+	MOV	R0, R2
+	ASL	R0
+	ADD	R0, R2			; 3 * index
+	MOVB	GSTATE+GS.COM(R2), R1
+	MOVB	RANKCH(R1), R0
+	JSR	PC, PUTC
+	MOV	#40, R0
+	JMP	PUTC
+5$:	MOV	#133, R0		; '[' ']' hidden computer piece
+	JSR	PC, PUTC
+	MOV	#135, R0
+	JMP	PUTC
+3$:	MOV	#C.BLU, R1
+	JSR	PC, SETCOL
+	BIC	#177700, R0		; piece index
+	MOV	R0, -(SP)
+	MOV	R0, R2
+	ASL	R0
+	ADD	R0, R2			; R2 = 3 * index (sizeof Piece)
+	MOVB	GSTATE+GS.PLA(R2), R1	; rank
+	MOVB	RANKCH(R1), R0
+	JSR	PC, PUTC
+	MOV	(SP)+, R1		; index
+	MOV	#40, R0			; ' '
+	TSTB	GSTATE+GS.KNO(R1)	; identified by the computer?
+	BEQ	4$
+	MOV	#52, R0			; '*'
+4$:	JMP	PUTC
+
+; DUP: print the character in R0 twice.
+DUP:	JSR	PC, PUTC
+	JMP	PUTC
+
+; WTKEY: wait for a key; R0 = character.  A key that arrives as an escape
+; sequence (ESC + code) comes back as code + (ESC in the high byte).
+WTKEY:	INC	RNDSEED			; counts every polling pass (seed 0 is fine: rng_seed maps it to 1)
+	TSTB	@#177560		; receiver ready?
+	BPL	WTKEY
+	CLR	R0
+	MOVB	@#177562, R0		; character into R0
+	CMPB	R0, #33			; ESC?
+	BNE	2$
+1$:	TSTB	@#177560		; wait for the second byte
+	BPL	1$
+	MOVB	@#177562, R0
+	BIS	#15400, R0		; ESC (033) into the high byte
+2$:	RETURN
+
+; SETCOL: set the character colour; R1 = colour 0..7; preserves R0.
+SETCOL:	MOV	R0, -(SP)
+	MOV	#33, R0			; ESC
+	JSR	PC, PUTC
+	MOV	#240, R0		; set character colour
+	JSR	PC, PUTC
+	MOV	R1, R0
+	ADD	#60, R0
+	JSR	PC, PUTC
+	MOV	(SP)+, R0
+	RETURN
+
+; PUTC: send the character in R0 to the PPU console (channel 0)
+PUTC:	TSTB	@#177564		; channel 0 transmitter ready?
+	BPL	PUTC			; no => wait
+	MOV	R0, @#177566		; send the character
+	RETURN
+
+; PRINT: print a string; R1 = address of a zero-terminated string; clobbers R0, R1
+PRINT:	MOVB	(R1)+, R0		; end of string?
+	BEQ	1$			; yes => done
+	JSR	PC, PUTC
+	BR	PRINT
+1$:	RETURN
+
+; GOTOXY: move the cursor; R1 = row (0..23), R2 = column (0..39); clobbers R0
+GOTOXY:	MOV	#33, R0			; ESC
+	JSR	PC, PUTC
+	MOV	#131, R0		; 'Y'
+	JSR	PC, PUTC
+	MOV	R1, R0
+	ADD	#40, R0			; row + 32
+	JSR	PC, PUTC
+	MOV	R2, R0
+	ADD	#40, R0			; column + 32
+	JSR	PC, PUTC
+	RETURN
+
+; PAUSE: let the PPU finish the previous commands; clobbers R5
+PAUSE:	MOV	#177777, R5
+1$:	NOP
+	SOB	R5, 1$
+	RETURN
+
+EXITSC:	; screen clearing string before the exit (80x24 format restored)
+	.BYTE	33,246,61		; screen format 80x24
+	.BYTE	33,240,67		; character colour
+	.BYTE	33,241,61		; character cell colour 1
+	.BYTE	33,242,61		; background colour 1
+	.BYTE	14			; clear screen
+	.BYTE	0
+GAMESC:	; intro screen setup string (80x24)
+	.BYTE	33,246,61		; screen format 80x24
+	.BYTE	33,240,67		; character colour
+	.BYTE	33,241,60		; character cell colour 0
+	.BYTE	33,242,60		; background colour 0
+	.BYTE	14			; clear screen
+	.BYTE	0
+GAME40:	; game screen setup string (40x24)
+	.BYTE	33,246,62		; screen format 40x24
+	.BYTE	33,240,67		; character colour
+	.BYTE	33,241,60		; character cell colour 0
+	.BYTE	33,242,60		; background colour 0
+	.BYTE	14			; clear screen
+	.BYTE	0
+STRANK:	.BYTE	10.,9.,8.,7.,6.,5.,4.,3.,2.,1.,11.,12.	; panel row -> rank
+STNAME:
+	.ASCIZ	/MARSHAL /
+	.ASCIZ	/GENERAL /
+	.ASCIZ	/COLONEL /
+	.ASCIZ	/MAJOR   /
+	.ASCIZ	/CAPTAIN /
+	.ASCIZ	/LIEUT.  /
+	.ASCIZ	/SERGEANT/
+	.ASCIZ	/MINER   /
+	.ASCIZ	/SCOUT   /
+	.ASCIZ	/SPY     /
+	.ASCIZ	/BOMB    /
+	.ASCIZ	/FLAG    /
+PRMTXT: .ASCIZ	/> /
+NEWTXT:	.ASCIZ	'New game? Y/N '
+EXTTXT:	.ASCIZ	'Exit? Y/N '
+HNTTXT:	.ASCIZ	/Use A-J,N,R,X keys/
+RSGTXT:	.ASCIZ	'Resign? Y/N '
+RSGOUT:	.ASCIZ	/RESIGNED/
+	.EVEN
+RESTAB:	.WORD	RESBTH, RESWIN, RESLOS	; indexed by Combat.result (BO_*)
+RESBTH:	.ASCIZ	/ tie/
+RESWIN:	.ASCIZ	/ won/
+RESLOS:	.ASCIZ	/ lost/
+	.EVEN
+DIRS:	.BYTE	0,-1, 0,1, -1,0, 1,0	; neighbour offsets (dc,dr)
+ARROW:	.ASCIZ	/ > /
+MSGBAD:	.ASCIZ	/Bad move/
+MSGILL:	.ASCIZ	/Illegal move/
+OVRTXT:	.ASCIZ	/GAME OVER /
+WINTXT:	.ASCIZ	/YOU WIN!/
+LOSTXT:	.ASCIZ	/YOU LOST/
+MOVEST:	.ASCIZ	/MOVE /
+HDRRED:	.ASCIZ	/RED /
+HDRBLU:	.ASCIZ	/BLU/
+RANKCH:	.ASCII	/?S23456789MBF/	; rank -> glyph (R_DEAD, spy, 2..9, marshal, bomb, flag)
+	.EVEN
+
+OSTACK:	.BLKW	1			; RT-11's SP at entry, restored by FINISH
+REVEAL:	.BLKW	1			; non-zero: the board shows the computer's ranks
+RNDSEED: .BLKW	1
+HINTF:	.BLKW	1
+MVFC:	.BLKW	1			; the player's move: from column, row, to column, row
+SMCOL:	.BLKW	1			; ADDMV parameters: colour of the side,
+						; mover rank, from column/row, to column/row
+SMRK:	.BLKW	1
+SMFC:	.BLKW	1
+SMFR:	.BLKW	1
+SMTC:	.BLKW	1
+SMTR:	.BLKW	1
+BMI:	.BLKW	1			; BLUMOV scratch: piece, its column/row, direction, target column
+BMC:	.BLKW	1
+BMR:	.BLKW	1
+BMD:	.BLKW	1
+BMTC:	.BLKW	1
+HIST:	.BLKB	HISTN*HE.SIZ		; the last HISTN moves, oldest first
+MVFR:	.BLKW	1
+MVTC:	.BLKW	1
+MVTR:	.BLKW	1
+TOTR:	.BLKW	1
+TOTB:	.BLKW	1
+ROUNDN:	.BLKW	1
+FROMID:	.BLKW	1
+MV:	.BLKB	MV.SIZ
+CI:	.BLKB	8.
+
+	.INCLUDE	/INTROSC.MAC/	; intro screen texts (generated)
+
+	.END	START

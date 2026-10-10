@@ -1,0 +1,36 @@
+;	STCORE.MAC - GameState / Move layout shared with the C core (core/stratego.h,
+;	core/ai.h).  Checked at build time by layout.c (_Static_assert), so
+;	drift fails the build - keep the two in step.
+
+GS.COM	=	0.		; Piece[40], 3 bytes each
+GS.PLA	=	120.
+GS.KNO	=	240.		; u8[40]
+GS.EMO	=	280.
+GS.MOV	=	320.
+GS.GRI	=	360.		; u8[100], grid[row*10+col]
+GS.PLE	=	460.
+GS.GUA	=	461.
+GS.GX	=	462.
+GS.GY	=	463.
+GS.MDF	=	464.
+
+PC.VAL	=	0.		; Piece
+PC.COL	=	1.
+PC.ROW	=	2.
+PC.SIZ	=	3.
+
+MV.SCO	=	0.		; Move: s16 score
+MV.COL	=	2.
+MV.ROW	=	3.
+MV.ATT	=	4.
+MV.URG	=	5.
+MV.SIZ	=	6.
+
+CB.FGT	=	0.		; Combat.fought
+CB.ATV	=	1.		; Combat.att_value
+CB.DEF	=	2.		; Combat.def_value
+CB.RES	=	5.		; Combat.result: 0 both die, 1 attacker wins, 2 defender wins
+CB.FLG	=	6.		; Combat.flag_taken
+
+SIDE.C	=	0.		; SIDE_COMP
+SIDE.P	=	1.		; SIDE_PLAY
