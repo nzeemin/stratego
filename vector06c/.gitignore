@@ -1,0 +1,20 @@
+# build output: !compile.cmd
+stratego.rom
+strateg0.bin
+strateg0.inc
+strateg0.lst
+strateg1.bin
+strateg1.lst
+*.zx0
+versio.inc
+
+strategb.inc
+strategb.bin
+
+# build output: !build-core.cmd
+core/core.bin
+core/core.map
+core/core.inc
+
+# scratch and tooling (x- prefix)
+x-*
